@@ -4,54 +4,111 @@ import pandas as pd
 import xgboost as xgb
 from pathlib import Path
 
+# Set project paths
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
+# Import project functions
 from src.data.preprocessing import encode_for_model
+from monitoring.drift_metrics import detect_drift_all_features
+from monitoring.rca import compute_rca
 from src.llm.gemini_explainer import explain_churn_and_drift
 
-# Results folder
-TABLES = ROOT / "results" / "tables"
 
-# Load actual monitoring results
-drift_df = pd.read_csv(TABLES / "drift_results.csv")
-rca_df = pd.read_csv(TABLES / "rca_results.csv")
+# Define paths
+DATA = ROOT / "data" / "raw"
+TABLES = ROOT / "results" / "tables"
+ARTIFACTS = ROOT / "artifacts"
+
+
+# --------------------------------------------------
+# 1. Load reference and current data
+# --------------------------------------------------
+
+reference_df = pd.read_csv(DATA / "reference.csv")
+current_df = pd.read_csv(DATA / "current.csv")
+
+
+# --------------------------------------------------
+# 2. Define feature lists
+# --------------------------------------------------
+
+NUMERIC_FEATURES = [
+    "tenure",
+    "MonthlyCharges",
+    "TotalCharges",
+    "SeniorCitizen"
+]
+
+CATEGORICAL_FEATURES = [
+    "gender",
+    "Partner",
+    "Dependents",
+    "PhoneService",
+    "MultipleLines",
+    "InternetService",
+    "OnlineSecurity",
+    "OnlineBackup",
+    "DeviceProtection",
+    "TechSupport",
+    "StreamingTV",
+    "StreamingMovies",
+    "Contract",
+    "PaperlessBilling",
+    "PaymentMethod"
+]
+
+
+# --------------------------------------------------
+# 3. Run actual drift detection
+# --------------------------------------------------
+
+drift_report = detect_drift_all_features(
+    reference_df,
+    current_df,
+    numeric_features=NUMERIC_FEATURES,
+    categorical_features=CATEGORICAL_FEATURES
+)
+
+
+# --------------------------------------------------
+# 4. Load global SHAP importance
+# --------------------------------------------------
 
 with open(TABLES / "shap_importance.json", "r") as f:
     global_shap = json.load(f)
 
-# Select scenario S1, seed 0
-scenario = "S1"
-seed = 0
 
-# Filter drift results
-drift_report = drift_df[
-    (drift_df["scenario"] == scenario) &
-    (drift_df["seed"] == seed)
-].to_dict(orient="records")
+# --------------------------------------------------
+# 5. Run actual Root Cause Analysis
+# --------------------------------------------------
 
-# Filter RCA results
-rca_report = rca_df[
-    (rca_df["scenario"] == scenario) &
-    (rca_df["seed"] == seed)
-].to_dict(orient="records")
+rca_report = compute_rca(
+    drift_report,
+    global_shap
+)
 
-# Demo prediction only — NOT a real customer prediction
-# Load a real customer from the current dataset
-current_df = pd.read_csv(ROOT / "data" / "raw" / "current.csv")
+
+# --------------------------------------------------
+# 6. Generate a real customer prediction
+# --------------------------------------------------
+
 customer = current_df.iloc[[0]]
 
-# Prepare features for the trained model
 X = encode_for_model(customer).drop(columns=["Churn"])
 
-features = pd.read_csv(ROOT / "artifacts" / "feature_names.csv").iloc[:, 0].tolist()
+features = (
+    pd.read_csv(ARTIFACTS / "feature_names.csv")
+    .iloc[:, 0]
+    .tolist()
+)
+
 X = X.reindex(columns=features, fill_value=0)
 
-# Load the trained model
 model = xgb.XGBClassifier()
-model.load_model(str(ROOT / "artifacts" / "xgb_model.json"))
+model.load_model(str(ARTIFACTS / "xgb_model.json"))
 
-# Generate the actual prediction
 prediction = int(model.predict(X)[0])
 probability = float(model.predict_proba(X)[0][1])
 
@@ -60,7 +117,11 @@ customer_prediction = {
     "probability": round(probability, 4)
 }
 
-# Send results to Gemini
+
+# --------------------------------------------------
+# 7. Send everything to Gemini
+# --------------------------------------------------
+
 result = explain_churn_and_drift(
     customer_prediction=customer_prediction,
     drift_report=drift_report,
@@ -68,5 +129,13 @@ result = explain_churn_and_drift(
     global_shap_importance=global_shap
 )
 
-# Print formatted JSON response
-print(json.dumps(result, indent=2))
+
+# --------------------------------------------------
+# 8. Display the explanation
+# --------------------------------------------------
+
+print("\nCustomer Prediction:")
+print(json.dumps(customer_prediction, indent=2))
+
+print("\nGemini Explanation:")
+print(json.dumps(result, indent=2, ensure_ascii=False))
